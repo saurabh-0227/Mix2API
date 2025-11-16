@@ -4,6 +4,7 @@ interface Env {
   ADMIN_PASSWORD?: string;
   AUTH_KEYS?: string;
   MODELS?: string;
+  DEBUG?: string;
   [key: string]: string | undefined;
 }
 
@@ -25,8 +26,6 @@ const DEFAULTS = {
 interface Stats {
   chatRequests: number;
   modelsRequests: number;
-  completionsRequests: number;
-  responsesRequests: number;
   totalCookies: number;
   activeCookies: number;
   totalQuota: number;
@@ -67,6 +66,22 @@ interface AdminSession {
   token: string;
   createdAt: number;
   expiresAt: number;
+}
+
+// ==================== 调试日志工具 ====================
+
+let DEBUG_MODE = false;
+
+function debugLog(...args: any[]) {
+  if (DEBUG_MODE) {
+    console.log("[DEBUG]", new Date().toISOString(), ...args);
+  }
+}
+
+function debugError(...args: any[]) {
+  if (DEBUG_MODE) {
+    console.error("[ERROR]", new Date().toISOString(), ...args);
+  }
 }
 
 // ==================== 工具函数 ====================
@@ -260,37 +275,6 @@ function normalizeMessages(messages: any[]): Array<{ role: string; content: stri
   });
 }
 
-function normalizeMessagesFromResponses(body: any): Array<{ role: string; content: string }> {
-  const input = body.input;
-  if (typeof input === "string") {
-    return [{ role: "user", content: input }];
-  }
-  if (Array.isArray(input)) {
-    const msgs: Array<{ role: string; content: string }> = [];
-    for (const item of input) {
-      if (!item) continue;
-      const role = item.role || "user";
-      let content = "";
-      if (typeof item.content === "string") {
-        content = item.content;
-      } else if (Array.isArray(item.content)) {
-        content = item.content
-          .map((part: any) => {
-            if (!part) return "";
-            if (typeof part === "string") return part;
-            if (typeof part.text === "string") return part.text;
-            if (typeof part.content === "string") return part.content;
-            return "";
-          })
-          .join("");
-      }
-      msgs.push({ role, content });
-    }
-    return msgs;
-  }
-  return [];
-}
-
 function generateId(prefix: string): string {
   return `${prefix}_${crypto.randomUUID()}`;
 }
@@ -307,6 +291,12 @@ function escapeHtml(str: string): string {
 // ==================== KV 操作 ====================
 
 async function initializeDefaultData(kv: Deno.Kv, env: Env) {
+  debugLog("Initializing default data...");
+  
+  // 设置 DEBUG 模式
+  DEBUG_MODE = env.DEBUG === "true" || env.DEBUG === "1";
+  debugLog("DEBUG mode:", DEBUG_MODE);
+  
   const defaultKeys = env.AUTH_KEYS
     ? env.AUTH_KEYS.split(",").map((k) => k.trim()).filter((k) => k)
     : DEFAULTS.AUTH_KEYS;
@@ -320,6 +310,7 @@ async function initializeDefaultData(kv: Deno.Kv, env: Env) {
         isDefault: true,
         createdAt: Date.now(),
       });
+      debugLog("Created default auth key:", key);
     }
   }
 
@@ -336,6 +327,7 @@ async function initializeDefaultData(kv: Deno.Kv, env: Env) {
         isDefault: true,
         createdAt: Date.now(),
       });
+      debugLog("Created default model:", modelId);
     }
   }
 
@@ -352,6 +344,7 @@ async function initializeDefaultData(kv: Deno.Kv, env: Env) {
           isDefault: true,
           lastChecked: Date.now(),
         });
+        debugLog("Created default cookie:", key);
       }
     }
   }
@@ -394,17 +387,12 @@ async function getEnabledModels(kv: Deno.Kv): Promise<string[]> {
   return models.filter((m) => m.isEnabled).map((m) => m.id);
 }
 
-// 带配额检查的获取启用的 cookies
 async function getEnabledCookies(kv: Deno.Kv): Promise<CookieAccount[]> {
   const cookies = await getAllCookies(kv);
   return cookies.filter((c) => {
     if (!c.isEnabled) return false;
-    
-    // 配额检查：只有剩余配额大于0的账户才启用
     const remaining = c.remaining ?? 0;
     const dailyLimit = c.dailyLimit ?? 0;
-    
-    // 如果没有配额信息（新账户），默认允许
     if (dailyLimit === 0 && remaining === 0) return true;
     return remaining > 0;
   });
@@ -425,8 +413,6 @@ async function updateStats(
   const stats: Stats = existing.value || {
     chatRequests: 0,
     modelsRequests: 0,
-    completionsRequests: 0,
-    responsesRequests: 0,
     totalCookies: 0,
     activeCookies: 0,
     totalQuota: 0,
@@ -445,8 +431,6 @@ async function getStats(kv: Deno.Kv): Promise<Stats> {
   return entry.value || {
     chatRequests: 0,
     modelsRequests: 0,
-    completionsRequests: 0,
-    responsesRequests: 0,
     totalCookies: 0,
     activeCookies: 0,
     totalQuota: 0,
@@ -498,7 +482,7 @@ async function deleteAdminSession(kv: Deno.Kv, token: string): Promise<void> {
   await kv.delete([KV_KEYS.SESSIONS, token]);
 }
 
-// ==================== 增强的 API 处理 - 带重试逻辑 ====================
+// ==================== API 处理 ====================
 
 async function checkAuth(kv: Deno.Kv, request: Request): Promise<boolean> {
   const headers = request.headers;
@@ -508,56 +492,19 @@ async function checkAuth(kv: Deno.Kv, request: Request): Promise<boolean> {
     headers.get("Authorization") ||
     headers.get("authorization");
   
-  if (!auth) return false;
-  
-  const cleanAuth = auth.replace(/^Bearer\s+/i, "");
-  return await isValidAuthKey(kv, cleanAuth);
-}
-
-// 带重试机制的获取 Movement cookies
-async function getMovementCookiesWithRetry(
-  kv: Deno.Kv,
-  maxRetries: number = 3
-): Promise<{ cookies: Record<string, string>; account: CookieAccount }> {
-  let lastError: Error | null = null;
-  
-  for (let i = 0; i < maxRetries; i++) {
-    const account = await pickRandomCookie(kv);
-    if (!account) {
-      throw new Error("No enabled cookie accounts available");
-    }
-
-    try {
-      // 先更新账户限制信息
-      const updatedAccount = await updateAccountLimits(kv, account);
-      
-      // 检查配额
-      const remaining = updatedAccount.remaining ?? 0;
-      const dailyLimit = updatedAccount.dailyLimit ?? 0;
-      const hasQuota = dailyLimit === 0 || remaining > 0;
-      
-      if (!hasQuota) {
-        console.warn(`Account ${account.name} has no quota, skipping...`);
-        continue; // 跳过这个账户，尝试下一个
-      }
-
-      const cookies = await getMovementCookies(updatedAccount);
-      return { cookies, account: updatedAccount };
-    } catch (e) {
-      lastError = e instanceof Error ? e : new Error(String(e));
-      console.warn(`Failed to get cookies for account ${account.name}, retrying... (${i + 1}/${maxRetries})`);
-      
-      // 更新账户错误信息
-      account.error = lastError.message;
-      await kv.set([KV_KEYS.COOKIES, account.id], account);
-    }
+  if (!auth) {
+    debugLog("No auth header found");
+    return false;
   }
   
-  throw lastError || new Error("Failed to get cookies after max retries");
+  const cleanAuth = auth.replace(/^Bearer\s+/i, "");
+  const isValid = await isValidAuthKey(kv, cleanAuth);
+  debugLog("Auth validation result:", isValid, "for key:", cleanAuth.substring(0, 10) + "...");
+  return isValid;
 }
 
-// 处理 /v1/models
 async function handleModels(kv: Deno.Kv, cors: Record<string, string>): Promise<Response> {
+  debugLog("Handling /v1/models request");
   const models = await getEnabledModels(kv);
   const created = Math.floor(Date.now() / 1000);
   
@@ -576,8 +523,9 @@ async function handleModels(kv: Deno.Kv, cors: Record<string, string>): Promise<
   );
 }
 
-// 获取 Movement cookies（基础函数）
 async function getMovementCookies(account: CookieAccount): Promise<Record<string, string>> {
+  debugLog("Getting Movement cookies for account:", account.name);
+  
   const baseCookies = parseCookieString(account.cookieString);
   const client = baseCookies["__client"];
   
@@ -586,6 +534,8 @@ async function getMovementCookies(account: CookieAccount): Promise<Record<string
       `${account.name} 缺少 __client Cookie。请在 ${account.name} 中至少配置 "__client=..."`
     );
   }
+
+  debugLog("Base cookies parsed, __client found:", client.substring(0, 20) + "...");
 
   const handshakeUrl =
     "https://clerk.movementlabs.ai/v1/client/handshake" +
@@ -596,10 +546,8 @@ async function getMovementCookies(account: CookieAccount): Promise<Record<string
     "&__clerk_hs_reason=session-token-but-no-client-uat" +
     "&format=nonce";
 
-  const cookieHeader =
-    account.cookieString.includes("__client=")
-      ? account.cookieString
-      : `__client=${client}`;
+  const cookieHeader = cookieMapToHeader(baseCookies);
+  debugLog("Requesting handshake with cookie header length:", cookieHeader.length);
 
   const res = await fetch(handshakeUrl, {
     method: "GET",
@@ -611,34 +559,41 @@ async function getMovementCookies(account: CookieAccount): Promise<Record<string
     redirect: "manual",
   });
 
+  debugLog("Handshake response status:", res.status);
+
   const setCookieHeader = res.headers.get("set-cookie") || "";
   const handshakeToken = extractHandshakeToken(setCookieHeader);
   
   if (!handshakeToken) {
     const text = await res.text().catch(() => "");
+    debugError("Failed to extract handshake token. Response:", text.slice(0, 500));
     throw new Error(
-      `无法从 Clerk handshake 响应中提取 __clerk_handshake Cookie (${account.name})。HTTP ${res.status}，响应片段：${text.slice(0, 200)}`
+      `无法从 Clerk handshake 响应中提取 __clerk_handshake Cookie (${account.name})。HTTP ${res.status}`
     );
   }
+
+  debugLog("Handshake token extracted successfully");
 
   const handshakeCookies = parseHandshakeCookies(handshakeToken);
   const merged = { ...baseCookies, ...handshakeCookies };
 
   if (!merged["__session"]) {
+    debugError("No __session cookie found after handshake");
     throw new Error(
       `Clerk handshake 响应中没有解析出 __session Cookie (${account.name})，请确认该账户已在浏览器中成功登录 movementlabs.ai。`
     );
   }
 
-  merged["__client"] = client;
+  debugLog("Cookies merged successfully, __session found");
   return merged;
 }
 
-// 更新账户限制信息
 async function updateAccountLimits(
   kv: Deno.Kv,
   account: CookieAccount
 ): Promise<CookieAccount> {
+  debugLog("Updating account limits for:", account.name);
+  
   try {
     const cookies = await getMovementCookies(account);
     const apiCookie = cookieMapToHeader(cookies);
@@ -653,6 +608,8 @@ async function updateAccountLimits(
       },
     });
 
+    debugLog("Limits API response status:", res.status);
+
     if (res.ok) {
       const data = await res.json();
       account.planType = data.planType;
@@ -661,11 +618,17 @@ async function updateAccountLimits(
       account.remaining = data.remaining;
       account.hasReachedLimit = data.hasReachedLimit;
       account.error = undefined;
+      debugLog("Account limits updated:", {
+        dailyLimit: account.dailyLimit,
+        remaining: account.remaining,
+      });
     } else {
       account.error = `HTTP ${res.status}`;
+      debugError("Failed to get limits:", account.error);
     }
   } catch (e) {
     account.error = e instanceof Error ? e.message : "Unknown error";
+    debugError("Error updating account limits:", account.error);
   }
   
   account.lastChecked = Date.now();
@@ -673,68 +636,80 @@ async function updateAccountLimits(
   return account;
 }
 
-// 带重试的聊天处理主函数
+async function getMovementCookiesWithRetry(
+  kv: Deno.Kv,
+  maxRetries: number = 3
+): Promise<{ cookies: Record<string, string>; account: CookieAccount }> {
+  debugLog("Getting cookies with retry, max retries:", maxRetries);
+  let lastError: Error | null = null;
+  
+  for (let i = 0; i < maxRetries; i++) {
+    const account = await pickRandomCookie(kv);
+    if (!account) {
+      throw new Error("No enabled cookie accounts available");
+    }
+
+    debugLog(`Attempt ${i + 1}/${maxRetries}, using account:`, account.name);
+
+    try {
+      const updatedAccount = await updateAccountLimits(kv, account);
+      
+      const remaining = updatedAccount.remaining ?? 0;
+      const dailyLimit = updatedAccount.dailyLimit ?? 0;
+      const hasQuota = dailyLimit === 0 || remaining > 0;
+      
+      if (!hasQuota) {
+        debugLog(`Account ${account.name} has no quota, trying next account...`);
+        continue;
+      }
+
+      const cookies = await getMovementCookies(updatedAccount);
+      debugLog("Successfully got cookies for account:", account.name);
+      return { cookies, account: updatedAccount };
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      debugError(`Failed to get cookies for account ${account.name}:`, lastError.message);
+      
+      account.error = lastError.message;
+      await kv.set([KV_KEYS.COOKIES, account.id], account);
+      
+      if (i < maxRetries - 1) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+      }
+    }
+  }
+  
+  throw lastError || new Error("Failed to get cookies after max retries");
+}
+
 async function handleChatCompletions(
   kv: Deno.Kv,
   request: Request,
   cors: Record<string, string>
 ): Promise<Response> {
-  return await handleRequestWithRetry(kv, request, cors, "chat");
-}
-
-// 带重试的 completions 处理
-async function handleCompletions(
-  kv: Deno.Kv,
-  request: Request,
-  cors: Record<string, string>
-): Promise<Response> {
-  return await handleRequestWithRetry(kv, request, cors, "completions");
-}
-
-// 带重试的 responses 处理
-async function handleResponses(
-  kv: Deno.Kv,
-  request: Request,
-  cors: Record<string, string>
-): Promise<Response> {
-  return await handleRequestWithRetry(kv, request, cors, "responses");
-}
-
-// 统一的带重试请求处理函数
-async function handleRequestWithRetry(
-  kv: Deno.Kv,
-  request: Request,
-  cors: Record<string, string>,
-  requestType: "chat" | "completions" | "responses",
-  maxRetries: number = 3
-): Promise<Response> {
-  let lastError: Error | null = null;
+  debugLog("Handling /v1/chat/completions request");
   
-  for (let i = 0; i < maxRetries; i++) {
+  const body = await request.json();
+  const stream = !!body.stream;
+  const model = body.model || "momentum";
+  const created = Math.floor(Date.now() / 1000);
+
+  debugLog("Request params - stream:", stream, "model:", model);
+
+  let lastError: Error | null = null;
+  const maxRetries = 3;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // 使用带重试的 cookie 获取
+      debugLog(`Chat request attempt ${attempt}/${maxRetries}`);
+      
       const { cookies, account } = await getMovementCookiesWithRetry(kv, 1);
       const apiCookie = cookieMapToHeader(cookies);
       
-      const body = await request.clone().json();
-      let movementReqBody: string;
-      
-      // 根据请求类型准备数据
-      if (requestType === "responses") {
-        const messages = normalizeMessagesFromResponses(body);
-        movementReqBody = JSON.stringify({ messages });
-      } else if (requestType === "completions") {
-        let prompt = "";
-        if (typeof body.prompt === "string") {
-          prompt = body.prompt;
-        } else if (Array.isArray(body.prompt)) {
-          prompt = body.prompt.join("\n");
-        }
-        movementReqBody = JSON.stringify({ messages: [{ role: "user", content: prompt }] });
-      } else {
-        const messages = normalizeMessages(body.messages || []);
-        movementReqBody = JSON.stringify({ messages });
-      }
+      const messages = normalizeMessages(body.messages || []);
+      const movementReqBody = JSON.stringify({ messages });
+
+      debugLog("Sending request to movementlabs.ai/api/chat");
 
       const movementRes = await fetch("https://movementlabs.ai/api/chat", {
         method: "POST",
@@ -749,42 +724,171 @@ async function handleRequestWithRetry(
         body: movementReqBody,
       });
 
+      debugLog("Movement API response status:", movementRes.status);
+
       if (!movementRes.ok) {
         const text = await movementRes.text().catch(() => "");
         throw new Error(`HTTP ${movementRes.status}: ${text.slice(0, 200)}`);
       }
 
-      // 更新统计
-      const stats = await getStats(kv);
-      if (requestType === "chat") {
-        await updateStats(kv, { chatRequests: stats.chatRequests + 1 });
-      } else if (requestType === "completions") {
-        await updateStats(kv, { completionsRequests: stats.completionsRequests + 1 });
-      } else {
-        await updateStats(kv, { responsesRequests: stats.responsesRequests + 1 });
+      await updateStats(kv, { chatRequests: (await getStats(kv)).chatRequests + 1 });
+
+      if (!stream) {
+        const raw = await movementRes.text();
+        const { answer } = parseMovementFullText(raw);
+        debugLog("Non-stream response completed, answer length:", answer.length);
+        
+        return new Response(
+          JSON.stringify({
+            id: generateId("chatcmpl"),
+            object: "chat.completion",
+            created,
+            model,
+            choices: [
+              {
+                index: 0,
+                message: { role: "assistant", content: answer },
+                logprobs: null,
+                finish_reason: "stop",
+              },
+            ],
+            usage: {
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              total_tokens: 0,
+            },
+            system_fingerprint: null,
+          }),
+          { status: 200, headers: { ...cors, "Content-Type": "application/json" } }
+        );
       }
 
-      // 根据请求类型处理响应
-      if (requestType === "responses") {
-        return await processResponsesResponse(kv, movementRes, body, cors, account);
-      } else if (requestType === "completions") {
-        return await processCompletionsResponse(kv, movementRes, body, cors, account);
-      } else {
-        return await processChatResponse(kv, movementRes, body, cors, account);
-      }
-      
+      debugLog("Starting stream response");
+      const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
+      const id = generateId("chatcmpl");
+      let first = true;
+
+      const streamBody = new ReadableStream({
+        async start(controller) {
+          const reader = movementRes.body!.getReader();
+          let buffer = "";
+
+          try {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+
+              buffer += decoder.decode(value, { stream: true });
+              let idx;
+              while ((idx = buffer.indexOf("\n")) !== -1) {
+                const line = buffer.slice(0, idx);
+                buffer = buffer.slice(idx + 1);
+
+                const p = parseMovementLine(line);
+                if (!p) continue;
+
+                if (p.type === "0") {
+                  const deltaText = p.text || "";
+                  if (!deltaText) continue;
+
+                  const chunk = {
+                    id,
+                    object: "chat.completion.chunk",
+                    created,
+                    model,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: first
+                          ? { role: "assistant", content: deltaText }
+                          : { content: deltaText },
+                        finish_reason: null,
+                      },
+                    ],
+                  };
+                  first = false;
+                  controller.enqueue(
+                    encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`)
+                  );
+                } else if (p.type === "d") {
+                  const doneChunk = {
+                    id,
+                    object: "chat.completion.chunk",
+                    created,
+                    model,
+                    choices: [
+                      {
+                        index: 0,
+                        delta: {},
+                        finish_reason: "stop",
+                      },
+                    ],
+                  };
+                  controller.enqueue(
+                    encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`)
+                  );
+                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                }
+              }
+            }
+
+            if (buffer.trim()) {
+              const p = parseMovementLine(buffer);
+              if (p && p.type === "d") {
+                controller.enqueue(
+                  encoder.encode(
+                    `data: ${JSON.stringify({
+                      id,
+                      object: "chat.completion.chunk",
+                      created,
+                      model,
+                      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                    })}\n\n`
+                  )
+                );
+                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+              }
+            }
+          } catch (e) {
+            debugError("Stream error:", e);
+            const err = {
+              error: {
+                message: e instanceof Error ? e.message : "Upstream error",
+                type: "server_error",
+                param: null,
+                code: null,
+              },
+            };
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(err)}\n\n`));
+          } finally {
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(streamBody, {
+        status: 200,
+        headers: {
+          ...cors,
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-cache",
+        },
+      });
+
     } catch (e) {
       lastError = e instanceof Error ? e : new Error(String(e));
-      console.warn(`${requestType} request failed, retrying... (${i + 1}/${maxRetries})`);
+      debugError(`Chat request attempt ${attempt} failed:`, lastError.message);
       
-      if (i === maxRetries - 1) {
-        break;
+      if (attempt < maxRetries) {
+        const delay = 1000 * attempt;
+        debugLog(`Retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
       }
-      
-      await new Promise(resolve => setTimeout(resolve, 500));
     }
   }
 
+  debugError("All retry attempts failed");
   return new Response(
     JSON.stringify({
       error: {
@@ -798,775 +902,7 @@ async function handleRequestWithRetry(
   );
 }
 
-// 处理 chat/completions 响应
-async function processChatResponse(
-  kv: Deno.Kv,
-  movementRes: Response,
-  body: any,
-  cors: Record<string, string>,
-  account: CookieAccount
-): Promise<Response> {
-  const stream = !!body.stream;
-  const model = body.model || "momentum";
-  const created = Math.floor(Date.now() / 1000);
-
-  if (!stream) {
-    const raw = await movementRes.text();
-    const { answer } = parseMovementFullText(raw);
-    return new Response(
-      JSON.stringify({
-        id: generateId("chatcmpl"),
-        object: "chat.completion",
-        created,
-        model,
-        choices: [
-          {
-            index: 0,
-            message: { role: "assistant", content: answer },
-            logprobs: null,
-            finish_reason: "stop",
-          },
-        ],
-        usage: {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0,
-        },
-        system_fingerprint: null,
-      }),
-      { status: 200, headers: { ...cors, "Content-Type": "application/json" } }
-    );
-  }
-
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const id = generateId("chatcmpl");
-  let first = true;
-
-  const streamBody = new ReadableStream({
-    async start(controller) {
-      const reader = movementRes.body!.getReader();
-      let buffer = "";
-
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          let idx;
-          while ((idx = buffer.indexOf("\n")) !== -1) {
-            const line = buffer.slice(0, idx);
-            buffer = buffer.slice(idx + 1);
-
-            const p = parseMovementLine(line);
-            if (!p) continue;
-
-            if (p.type === "0") {
-              const deltaText = p.text || "";
-              if (!deltaText) continue;
-
-              const chunk = {
-                id,
-                object: "chat.completion.chunk",
-                created,
-                model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: first
-                      ? { role: "assistant", content: deltaText }
-                      : { content: deltaText },
-                    finish_reason: null,
-                  },
-                ],
-              };
-              first = false;
-              controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`)
-              );
-            } else if (p.type === "d") {
-              const doneChunk = {
-                id,
-                object: "chat.completion.chunk",
-                created,
-                model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: {},
-                    finish_reason: "stop",
-                  },
-                ],
-              };
-              controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`)
-              );
-              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-            }
-          }
-        }
-
-        if (buffer.trim()) {
-          const p = parseMovementLine(buffer);
-          if (p && p.type === "d") {
-            controller.enqueue(
-              encoder.encode(
-                `data: ${JSON.stringify({
-                  id,
-                  object: "chat.completion.chunk",
-                  created,
-                  model,
-                  choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                })}\n\n`
-              )
-            );
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          }
-        }
-      } catch (e) {
-        const err = {
-          error: {
-            message: e instanceof Error ? e.message : "Upstream error",
-            type: "server_error",
-            param: null,
-            code: null,
-          },
-        };
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(err)}\n\n`));
-      } finally {
-        controller.close();
-      }
-    },
-  });
-
-  return new Response(streamBody, {
-    status: 200,
-    headers: {
-      ...cors,
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache",
-    },
-  });
-}
-
-// 处理 completions 响应
-async function processCompletionsResponse(
-  kv: Deno.Kv,
-  movementRes: Response,
-  body: any,
-  cors: Record<string, string>,
-  account: CookieAccount
-): Promise<Response> {
-  const stream = !!body.stream;
-  const model = body.model || "momentum";
-  const created = Math.floor(Date.now() / 1000);
-
-  if (!stream) {
-    const raw = await movementRes.text();
-    const { answer } = parseMovementFullText(raw);
-    return new Response(
-      JSON.stringify({
-        id: generateId("cmpl"),
-        object: "text_completion",
-        created,
-        model,
-        choices: [
-          {
-            index: 0,
-            text: answer,
-            logprobs: null,
-            finish_reason: "stop",
-          },
-        ],
-        usage: {
-          prompt_tokens: 0,
-          completion_tokens: 0,
-          total_tokens: 0,
-        },
-      }),
-      { status: 200, headers: { ...cors, "Content-Type": "application/json" } }
-    );
-  }
-
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const id = generateId("cmpl");
-
-  const streamBody = new ReadableStream({
-    async start(controller) {
-      const reader = movementRes.body!.getReader();
-      let buffer = "";
-
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          let idx;
-          while ((idx = buffer.indexOf("\n")) !== -1) {
-            const line = buffer.slice(0, idx);
-            buffer = buffer.slice(idx + 1);
-
-            const p = parseMovementLine(line);
-            if (!p) continue;
-
-            if (p.type === "0") {
-              const deltaText = p.text || "";
-              if (!deltaText) continue;
-
-              const chunk = {
-                id,
-                object: "text_completion",
-                created,
-                model,
-                choices: [
-                  {
-                    index: 0,
-                    text: deltaText,
-                    logprobs: null,
-                    finish_reason: null,
-                  },
-                ],
-              };
-              controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`)
-              );
-            } else if (p.type === "d") {
-              const doneChunk = {
-                id,
-                object: "text_completion",
-                created,
-                model,
-                choices: [
-                  {
-                    index: 0,
-                    text: "",
-                    logprobs: null,
-                    finish_reason: "stop",
-                  },
-                ],
-              };
-              controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`)
-              );
-              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-            }
-          }
-        }
-
-        if (buffer.trim()) {
-          const p = parseMovementLine(buffer);
-          if (p && p.type === "d") {
-            const doneChunk = {
-              id,
-              object: "text_completion",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  text: "",
-                  logprobs: null,
-                  finish_reason: "stop",
-                },
-              ],
-            };
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify(doneChunk)}\n\n`)
-            );
-            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          }
-        }
-      } catch (e) {
-        const err = {
-          error: {
-            message: e instanceof Error ? e.message : "Upstream error",
-            type: "server_error",
-            param: null,
-            code: null,
-          },
-        };
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify(err)}\n\n`));
-      } finally {
-        controller.close();
-      }
-    },
-  });
-
-  return new Response(streamBody, {
-    status: 200,
-    headers: {
-      ...cors,
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache",
-    },
-  });
-}
-
-// 处理 responses 响应
-async function processResponsesResponse(
-  kv: Deno.Kv,
-  movementRes: Response,
-  body: any,
-  cors: Record<string, string>,
-  account: CookieAccount
-): Promise<Response> {
-  const stream = !!body.stream;
-  const model = body.model || "momentum";
-  const createdAt = Math.floor(Date.now() / 1000);
-  const responseId = generateId("resp");
-  const reasoningItemId = generateId("rs");
-  const messageItemId = generateId("msg");
-
-  if (!stream) {
-    const raw = await movementRes.text();
-    const { thinking, answer } = parseMovementFullText(raw);
-    const output = [];
-    
-    if (thinking) {
-      output.push({
-        id: reasoningItemId,
-        type: "reasoning",
-        status: "completed",
-        role: null,
-        content: [
-          {
-            type: "reasoning_text",
-            text: thinking,
-          },
-        ],
-        summary: [],
-      });
-    }
-    
-    if (answer) {
-      output.push({
-        id: messageItemId,
-        type: "message",
-        status: "completed",
-        role: "assistant",
-        content: [
-          {
-            type: "output_text",
-            text: answer,
-            annotations: [],
-          },
-        ],
-      });
-    }
-
-    const resp = {
-      id: responseId,
-      object: "response",
-      created_at: createdAt,
-      status: "completed",
-      background: false,
-      content_filters: null,
-      error: null,
-      incomplete_details: null,
-      instructions: null,
-      max_output_tokens: null,
-      max_tool_calls: null,
-      model,
-      output,
-      parallel_tool_calls: true,
-      previous_response_id: null,
-      prompt_cache_key: null,
-      reasoning: { effort: null, summary: null },
-      safety_identifier: null,
-      service_tier: "default",
-      store: true,
-      temperature: typeof body.temperature === "number" ? body.temperature : 1.0,
-      text: { format: { type: "text" } },
-      tool_choice: body.tool_choice || "auto",
-      tools: Array.isArray(body.tools) ? body.tools : [],
-      top_p: typeof body.top_p === "number" ? body.top_p : 1.0,
-      truncation: "disabled",
-      usage: {
-        input_tokens: 0,
-        input_tokens_details: { cached_tokens: 0 },
-        output_tokens: 0,
-        output_tokens_details: { reasoning_tokens: 0 },
-        total_tokens: 0,
-      },
-      user: body.user || null,
-      metadata: body.metadata || {},
-    };
-
-    return new Response(
-      JSON.stringify(resp),
-      { status: 200, headers: { ...cors, "Content-Type": "application/json" } }
-    );
-  }
-
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const id = responseId;
-  const responseSkeleton = {
-    id,
-    object: "response",
-    created_at: createdAt,
-    status: "in_progress",
-    background: false,
-    content_filters: null,
-    error: null,
-    incomplete_details: null,
-    instructions: null,
-    max_output_tokens: null,
-    max_tool_calls: null,
-    model,
-    output: [],
-    parallel_tool_calls: true,
-    previous_response_id: null,
-    prompt_cache_key: null,
-    reasoning: { effort: null, summary: null },
-    safety_identifier: null,
-    service_tier: "default",
-    store: true,
-    temperature: typeof body.temperature === "number" ? body.temperature : 1.0,
-    text: { format: { type: "text" } },
-    tool_choice: body.tool_choice || "auto",
-    tools: Array.isArray(body.tools) ? body.tools : [],
-    top_p: typeof body.top_p === "number" ? body.top_p : 1.0,
-    truncation: "disabled",
-    usage: null,
-    user: body.user || null,
-    metadata: body.metadata || {},
-  };
-  let sequence = 0;
-
-  const streamBody = new ReadableStream({
-    async start(controller) {
-      const sendEvent = (obj: any) => {
-        controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify(obj)}\n\n`)
-        );
-      };
-
-      const reader = movementRes.body!.getReader();
-      let buffer = "";
-      let thinkingText = "";
-      let answerText = "";
-      let reasoningItemInitialized = false;
-      let messageItemInitialized = false;
-
-      sendEvent({
-        type: "response.created",
-        sequence_number: sequence++,
-        response: responseSkeleton,
-        model,
-      });
-
-      sendEvent({
-        type: "response.in_progress",
-        sequence_number: sequence++,
-        response: responseSkeleton,
-        model,
-      });
-
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          let idx;
-          while ((idx = buffer.indexOf("\n")) !== -1) {
-            const line = buffer.slice(0, idx);
-            buffer = buffer.slice(idx + 1);
-
-            const p = parseMovementLine(line);
-            if (!p) continue;
-
-            if (p.type === "g") {
-              const delta = p.text || "";
-              if (!delta) continue;
-
-              if (!reasoningItemInitialized) {
-                reasoningItemInitialized = true;
-                sendEvent({
-                  type: "response.output_item.added",
-                  sequence_number: sequence++,
-                  output_index: 0,
-                  item: {
-                    id: reasoningItemId,
-                    type: "reasoning",
-                    status: "in_progress",
-                    content: [],
-                    summary: [],
-                  },
-                  model,
-                });
-                sendEvent({
-                  type: "response.content_part.added",
-                  sequence_number: sequence++,
-                  item_id: reasoningItemId,
-                  output_index: 0,
-                  content_index: 0,
-                  part: {
-                    type: "reasoning_text",
-                    text: "",
-                  },
-                  model,
-                });
-              }
-              
-              thinkingText += delta;
-              sendEvent({
-                type: "response.reasoning_text.delta",
-                sequence_number: sequence++,
-                item_id: reasoningItemId,
-                output_index: 0,
-                content_index: 0,
-                delta,
-              });
-            } else if (p.type === "0") {
-              const delta = p.text || "";
-              if (!delta) continue;
-
-              if (!messageItemInitialized) {
-                messageItemInitialized = true;
-                const outputIndex = reasoningItemInitialized ? 1 : 0;
-                sendEvent({
-                  type: "response.output_item.added",
-                  sequence_number: sequence++,
-                  output_index: outputIndex,
-                  item: {
-                    id: messageItemId,
-                    type: "message",
-                    status: "in_progress",
-                    content: [],
-                    role: "assistant",
-                  },
-                  model,
-                });
-                sendEvent({
-                  type: "response.content_part.added",
-                  sequence_number: sequence++,
-                  item_id: messageItemId,
-                  output_index: outputIndex,
-                  content_index: 0,
-                  part: {
-                    type: "output_text",
-                    annotations: [],
-                    text: "",
-                  },
-                  model,
-                });
-              }
-              
-              answerText += delta;
-              const outputIndex = reasoningItemInitialized ? 1 : 0;
-              sendEvent({
-                type: "response.output_text.delta",
-                sequence_number: sequence++,
-                item_id: messageItemId,
-                output_index: outputIndex,
-                content_index: 0,
-                delta: { type: "output_text", text: delta },
-                model,
-              });
-            } else if (p.type === "d") {
-              if (thinkingText && reasoningItemInitialized) {
-                sendEvent({
-                  type: "response.reasoning_text.done",
-                  sequence_number: sequence++,
-                  item_id: reasoningItemId,
-                  output_index: 0,
-                  content_index: 0,
-                  text: thinkingText,
-                });
-              }
-
-              if (answerText && messageItemInitialized) {
-                const outputIndex = reasoningItemInitialized ? 1 : 0;
-                sendEvent({
-                  type: "response.output_text.done",
-                  sequence_number: sequence++,
-                  item_id: messageItemId,
-                  output_index: outputIndex,
-                  content_index: 0,
-                  text: answerText,
-                  model,
-                });
-                sendEvent({
-                  type: "response.content_part.done",
-                  sequence_number: sequence++,
-                  item_id: messageItemId,
-                  output_index: outputIndex,
-                  content_index: 0,
-                  part: {
-                    type: "output_text",
-                    annotations: [],
-                    text: answerText,
-                  },
-                  model,
-                });
-              }
-
-              const output = [];
-              if (thinkingText) {
-                output.push({
-                  id: reasoningItemId,
-                  type: "reasoning",
-                  status: "completed",
-                  content: [
-                    {
-                      type: "reasoning_text",
-                      text: thinkingText,
-                    },
-                  ],
-                  summary: [],
-                });
-              }
-              
-              if (answerText) {
-                output.push({
-                  id: messageItemId,
-                  type: "message",
-                  status: "completed",
-                  role: "assistant",
-                  content: [
-                    {
-                      type: "output_text",
-                      annotations: [],
-                      text: answerText,
-                    },
-                  ],
-                });
-              }
-
-              const finalResponse = {
-                ...responseSkeleton,
-                status: "completed",
-                output,
-                usage: {
-                  input_tokens: 0,
-                  input_tokens_details: { cached_tokens: 0 },
-                  output_tokens: 0,
-                  output_tokens_details: { reasoning_tokens: 0 },
-                  total_tokens: 0,
-                },
-              };
-
-              if (thinkingText) {
-                sendEvent({
-                  type: "response.output_item.done",
-                  sequence_number: sequence++,
-                  output_index: 0,
-                  item: finalResponse.output[0],
-                  model,
-                });
-              }
-
-              if (answerText) {
-                const outputIndex = thinkingText ? 1 : 0;
-                sendEvent({
-                  type: "response.output_item.done",
-                  sequence_number: sequence++,
-                  output_index: outputIndex,
-                  item: thinkingText ? finalResponse.output[1] : finalResponse.output[0],
-                  model,
-                });
-              }
-
-              sendEvent({
-                type: "response.completed",
-                sequence_number: sequence++,
-                response: finalResponse,
-                model,
-              });
-            }
-          }
-        }
-
-        if (buffer.trim()) {
-          const p = parseMovementLine(buffer);
-          if (p && p.type === "d") {
-            const output = [];
-            if (thinkingText) {
-              output.push({
-                id: reasoningItemId,
-                type: "reasoning",
-                status: "completed",
-                content: [
-                  {
-                    type: "reasoning_text",
-                    text: thinkingText,
-                  },
-                ],
-                summary: [],
-              });
-            }
-            
-            if (answerText) {
-              output.push({
-                id: messageItemId,
-                type: "message",
-                status: "completed",
-                role: "assistant",
-                content: [
-                  {
-                    type: "output_text",
-                    annotations: [],
-                    text: answerText,
-                  },
-                ],
-              });
-            }
-            
-            const finalResponse = {
-              ...responseSkeleton,
-              status: "completed",
-              output,
-              usage: {
-                input_tokens: 0,
-                input_tokens_details: { cached_tokens: 0 },
-                output_tokens: 0,
-                output_tokens_details: { reasoning_tokens: 0 },
-                total_tokens: 0,
-              },
-            };
-            
-            sendEvent({
-              type: "response.completed",
-              sequence_number: sequence++,
-              response: finalResponse,
-              model,
-            });
-          }
-        }
-      } catch (e) {
-        sendEvent({
-          type: "response.error",
-          sequence_number: sequence++,
-          error: {
-            message: e instanceof Error ? e.message : "Upstream error",
-            type: "server_error",
-            param: null,
-            code: null,
-          },
-          model,
-        });
-      } finally {
-        controller.close();
-      }
-    },
-  });
-
-  return new Response(streamBody, {
-    status: 200,
-    headers: {
-      ...cors,
-      "Content-Type": "text/event-stream; charset=utf-8",
-      "Cache-Control": "no-cache",
-    },
-  });
-}
-
-// ==================== 管理面板 UI - 侧边栏布局 ====================
+// ==================== 管理面板 UI ====================
 
 function renderLoginPage(error?: string): string {
   return `<!DOCTYPE html>
@@ -1624,13 +960,82 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
     .sidebar-active { background-color: #f3f4f6; border-left: 3px solid #6366f1; }
     .content-section { display: none; }
     .content-section.active { display: block; }
+    
+    @media (max-width: 768px) {
+      .sidebar {
+        position: fixed;
+        left: -100%;
+        top: 0;
+        bottom: 0;
+        width: 280px;
+        transition: left 0.3s ease;
+        z-index: 50;
+        box-shadow: 2px 0 10px rgba(0,0,0,0.1);
+      }
+      .sidebar.open {
+        left: 0;
+      }
+      .sidebar-overlay {
+        display: none;
+        position: fixed;
+        inset: 0;
+        background: rgba(0,0,0,0.5);
+        z-index: 40;
+      }
+      .sidebar-overlay.open {
+        display: block;
+      }
+      .mobile-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 1rem;
+        background: white;
+        border-bottom: 1px solid #e5e7eb;
+      }
+    }
+    
+    @media (min-width: 769px) {
+      .sidebar {
+        position: relative;
+        width: 16rem;
+      }
+      .mobile-menu-btn, .mobile-header, .sidebar-overlay {
+        display: none;
+      }
+    }
+    
+    @media (max-width: 640px) {
+      .table-container {
+        overflow-x: auto;
+      }
+      table {
+        min-width: 640px;
+      }
+    }
   </style>
 </head>
 <body class="bg-gray-50">
+  <div class="mobile-header lg:hidden">
+    <div class="flex items-center">
+      <div class="w-8 h-8 bg-gradient-to-br from-indigo-500 to-green-500 rounded-lg flex items-center justify-center text-white font-bold mr-2">M</div>
+      <div>
+        <h1 class="text-lg font-bold text-gray-800">MovementLabs</h1>
+        <p class="text-xs text-gray-500">API 管理面板</p>
+      </div>
+    </div>
+    <button onclick="toggleSidebar()" class="p-2 rounded-lg text-gray-600 hover:bg-gray-100">
+      <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+      </svg>
+    </button>
+  </div>
+
+  <div id="sidebarOverlay" class="sidebar-overlay" onclick="toggleSidebar()"></div>
+
   <div class="flex h-screen">
-    <!-- 左侧固定侧边栏 -->
-    <div class="w-64 bg-white shadow-lg">
-      <div class="p-6 border-b border-gray-200">
+    <div id="sidebar" class="sidebar bg-white">
+      <div class="p-6 border-b border-gray-200 hidden lg:block">
         <div class="flex items-center">
           <div class="w-10 h-10 bg-gradient-to-br from-indigo-500 to-green-500 rounded-lg flex items-center justify-center text-white font-bold mr-3">M</div>
           <div>
@@ -1640,10 +1045,10 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
         </div>
       </div>
       
-      <nav class="p-4">
+      <nav class="p-4 flex-1">
         <ul class="space-y-2">
           <li>
-            <a href="#" onclick="showSection('dashboard'); return false;" id="nav-dashboard" class="block px-4 py-3 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors sidebar-active">
+            <a href="#" onclick="showSection('dashboard'); closeSidebar(); return false;" id="nav-dashboard" class="block px-4 py-3 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors sidebar-active">
               <svg class="w-5 h-5 inline-block mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2H5a2 2 0 00-2-2z"></path>
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 5a2 2 0 012-2h4a2 2 0 012 2v6H8V5z"></path>
@@ -1652,7 +1057,7 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
             </a>
           </li>
           <li>
-            <a href="#" onclick="showSection('cookies'); return false;" id="nav-cookies" class="block px-4 py-3 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors">
+            <a href="#" onclick="showSection('cookies'); closeSidebar(); return false;" id="nav-cookies" class="block px-4 py-3 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors">
               <svg class="w-5 h-5 inline-block mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m13.5-9a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z"></path>
               </svg>
@@ -1660,7 +1065,7 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
             </a>
           </li>
           <li>
-            <a href="#" onclick="showSection('auth'); return false;" id="nav-auth" class="block px-4 py-3 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors">
+            <a href="#" onclick="showSection('auth'); closeSidebar(); return false;" id="nav-auth" class="block px-4 py-3 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors">
               <svg class="w-5 h-5 inline-block mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path>
               </svg>
@@ -1668,7 +1073,7 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
             </a>
           </li>
           <li>
-            <a href="#" onclick="showSection('models'); return false;" id="nav-models" class="block px-4 py-3 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors">
+            <a href="#" onclick="showSection('models'); closeSidebar(); return false;" id="nav-models" class="block px-4 py-3 rounded-lg text-gray-700 hover:bg-gray-100 transition-colors">
               <svg class="w-5 h-5 inline-block mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
               </svg>
@@ -1678,7 +1083,7 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
         </ul>
       </nav>
       
-      <div class="absolute bottom-4 left-4 right-4">
+      <div class="p-4 border-t border-gray-200 mt-auto">
         <button onclick="logout()" class="w-full bg-red-50 text-red-600 px-4 py-3 rounded-lg hover:bg-red-100 transition-colors text-sm font-medium">
           <svg class="w-5 h-5 inline-block mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
@@ -1688,67 +1093,65 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
       </div>
     </div>
 
-    <!-- 右侧主内容区域 -->
-    <div class="flex-1 overflow-y-auto">
-      <div class="p-8">
-        <!-- 系统概览 -->
+    <div class="flex-1 overflow-y-auto lg:ml-0">
+      <div class="p-4 lg:p-8">
         <div id="dashboard-section" class="content-section active">
-          <div class="mb-8">
-            <h2 class="text-2xl font-bold text-gray-800 mb-2">系统概览</h2>
-            <p class="text-gray-500">实时监控系统运行状态</p>
+          <div class="mb-6 lg:mb-8">
+            <h2 class="text-xl lg:text-2xl font-bold text-gray-800 mb-2">系统概览</h2>
+            <p class="text-gray-500 text-sm lg:text-base">实时监控系统运行状态</p>
           </div>
           
-          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-            <div class="bg-white rounded-xl shadow-sm p-6">
+          <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 lg:gap-6 mb-6 lg:mb-8">
+            <div class="bg-white rounded-xl shadow-sm p-4 lg:p-6">
               <div class="flex items-center justify-between">
                 <div>
-                  <p class="text-sm text-gray-500">聊天请求</p>
-                  <p class="text-2xl font-bold text-gray-800 mt-1">${stats.chatRequests.toLocaleString()}</p>
+                  <p class="text-xs lg:text-sm text-gray-500">聊天请求</p>
+                  <p class="text-xl lg:text-2xl font-bold text-gray-800 mt-1">${stats.chatRequests.toLocaleString()}</p>
                 </div>
-                <div class="w-10 h-10 bg-blue-100 rounded-lg flex items-center justify-center">
-                  <svg class="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <div class="w-8 h-8 lg:w-10 lg:h-10 bg-blue-100 rounded-lg flex items-center justify-center">
+                  <svg class="w-4 h-4 lg:w-6 lg:h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"></path>
                   </svg>
                 </div>
               </div>
             </div>
 
-            <div class="bg-white rounded-xl shadow-sm p-6">
+            <div class="bg-white rounded-xl shadow-sm p-4 lg:p-6">
               <div class="flex items-center justify-between">
                 <div>
-                  <p class="text-sm text-gray-500">模型请求</p>
-                  <p class="text-2xl font-bold text-gray-800 mt-1">${stats.modelsRequests.toLocaleString()}</p>
+                  <p class="text-xs lg:text-sm text-gray-500">模型请求</p>
+                  <p class="text-xl lg:text-2xl font-bold text-gray-800 mt-1">${stats.modelsRequests.toLocaleString()}</p>
                 </div>
-                <div class="w-10 h-10 bg-purple-100 rounded-lg flex items-center justify-center">
-                  <svg class="w-6 h-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <div class="w-8 h-8 lg:w-10 lg:h-10 bg-purple-100 rounded-lg flex items-center justify-center">
+                  <svg class="w-4 h-4 lg:w-6 lg:h-6 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
                   </svg>
                 </div>
               </div>
             </div>
 
-            <div class="bg-white rounded-xl shadow-sm p-6">
+            <div class="bg-white rounded-xl shadow-sm p-4 lg:p-6">
               <div class="flex items-center justify-between">
                 <div>
-                  <p class="text-sm text-gray-500">活跃账户</p>
-                  <p class="text-2xl font-bold text-gray-800 mt-1">${activeCookies} / ${totalCookies}</p>
+                  <p class="text-xs lg:text-sm text-gray-500">活跃账户</p>
+                  <p class="text-xl lg:text-2xl font-bold text-gray-800 mt-1">${activeCookies} / ${totalCookies}</p>
                 </div>
-                <div class="w-10 h-10 bg-green-100 rounded-lg flex items-center justify-center">
-                  <svg class="w-6 h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <div class="w-8 h-8 lg:w-10 lg:h-10 bg-green-100 rounded-lg flex items-center justify-center">
+                  <svg class="w-4 h-4 lg:w-6 lg:h-6 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197m13.5-9a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z"></path>
                   </svg>
                 </div>
               </div>
             </div>
 
-            <div class="bg-white rounded-xl shadow-sm p-6">
+            <div class="bg-white rounded-xl shadow-sm p-4 lg:p-6">
               <div class="flex items-center justify-between">
                 <div>
-                  <p class="text-sm text-gray-500">剩余配额</p>
-                  <p class="text-2xl font-bold text-gray-800 mt-1">${remainingQuota.toLocaleString()} / ${totalQuota.toLocaleString()}</p>
+                  <p class="text-xs lg:text-sm text-gray-500">剩余配额</p>
+                  <p class="text-xl lg:text-2xl font-bold text-gray-800 mt-1">${remainingQuota.toLocaleString()} / ${totalQuota.toLocaleString()}</p>
                 </div>
-                <div class="w-10 h-10 bg-yellow-100 rounded-lg flex items-center justify-center">
-                  <svg class="w-6 h-6 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <div class="w-8 h-8 lg:w-10 lg:h-10 bg-yellow-100 rounded-lg flex items-center justify-center">
+                  <svg class="w-4 h-4 lg:w-6 lg:h-6 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                   </svg>
                 </div>
@@ -1756,58 +1159,57 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
             </div>
           </div>
 
-          <div class="bg-blue-50 border border-blue-200 rounded-lg p-4">
+          <div class="bg-blue-50 border border-blue-200 rounded-lg p-3 lg:p-4">
             <div class="flex items-center">
-              <svg class="w-5 h-5 text-blue-600 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <svg class="w-4 h-4 lg:w-5 lg:h-5 text-blue-600 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
               </svg>
-              <p class="text-sm text-blue-800">系统会自动选择有剩余配额的账户，并在请求失败时自动重试</p>
+              <p class="text-xs lg:text-sm text-blue-800">系统会自动选择有剩余配额的账户,并在请求失败时自动重试</p>
             </div>
           </div>
         </div>
 
-        <!-- Cookie 账户管理 -->
         <div id="cookies-section" class="content-section">
-          <div class="mb-6">
-            <h2 class="text-2xl font-bold text-gray-800 mb-2">Cookie 账户管理</h2>
-            <p class="text-gray-500">管理系统使用的 Cookie 账户</p>
+          <div class="mb-4 lg:mb-6">
+            <h2 class="text-xl lg:text-2xl font-bold text-gray-800 mb-2">Cookie 账户管理</h2>
+            <p class="text-gray-500 text-sm lg:text-base">管理系统使用的 Cookie 账户</p>
           </div>
           
           <div class="flex justify-between items-center mb-4">
-            <button onclick="addCookie()" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors">
+            <button onclick="addCookie()" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors text-sm lg:text-base">
               添加 Cookie
             </button>
           </div>
           
-          <div class="bg-white rounded-xl shadow-sm overflow-hidden">
+          <div class="bg-white rounded-xl shadow-sm overflow-hidden table-container">
             <table class="min-w-full divide-y divide-gray-200">
               <thead class="bg-gray-50">
                 <tr>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">名称</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">套餐类型</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">每日限额</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">已使用</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">剩余</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">状态</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">名称</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">套餐类型</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">每日限额</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">已使用</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">剩余</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">状态</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
                 </tr>
               </thead>
               <tbody class="bg-white divide-y divide-gray-200">
                 ${cookies.map((cookie) => `
                   <tr>
-                    <td class="px-6 py-4 text-sm text-gray-900">${escapeHtml(cookie.name)}</td>
-                    <td class="px-6 py-4 text-sm text-gray-500">${escapeHtml(cookie.planType || "-")}</td>
-                    <td class="px-6 py-4 text-sm text-gray-500">${cookie.dailyLimit ?? "-"}</td>
-                    <td class="px-6 py-4 text-sm text-gray-500">${cookie.currentCount ?? "-"}</td>
-                    <td class="px-6 py-4 text-sm text-gray-500">${cookie.remaining ?? "-"}</td>
-                    <td class="px-6 py-4">
+                    <td class="px-4 lg:px-6 py-4 text-sm text-gray-900">${escapeHtml(cookie.name)}</td>
+                    <td class="px-4 lg:px-6 py-4 text-sm text-gray-500">${escapeHtml(cookie.planType || "-")}</td>
+                    <td class="px-4 lg:px-6 py-4 text-sm text-gray-500">${cookie.dailyLimit ?? "-"}</td>
+                    <td class="px-4 lg:px-6 py-4 text-sm text-gray-500">${cookie.currentCount ?? "-"}</td>
+                    <td class="px-4 lg:px-6 py-4 text-sm text-gray-500">${cookie.remaining ?? "-"}</td>
+                    <td class="px-4 lg:px-6 py-4">
                       <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
                         cookie.isEnabled ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-800"
                       }">
                         ${cookie.isEnabled ? "启用" : "禁用"}
                       </span>
                     </td>
-                    <td class="px-6 py-4 text-sm space-x-2">
+                    <td class="px-4 lg:px-6 py-4 text-sm space-x-2">
                       <button onclick="toggleCookie('${cookie.id}')" class="text-indigo-600 hover:text-indigo-900">
                         ${cookie.isEnabled ? "禁用" : "启用"}
                       </button>
@@ -1820,44 +1222,43 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
           </div>
         </div>
 
-        <!-- API 密钥管理 -->
         <div id="auth-section" class="content-section">
-          <div class="mb-6">
-            <h2 class="text-2xl font-bold text-gray-800 mb-2">API 密钥管理</h2>
-            <p class="text-gray-500">管理 API 访问鉴权密钥</p>
+          <div class="mb-4 lg:mb-6">
+            <h2 class="text-xl lg:text-2xl font-bold text-gray-800 mb-2">API 密钥管理</h2>
+            <p class="text-gray-500 text-sm lg:text-base">管理 API 访问鉴权密钥</p>
           </div>
           
           <div class="flex justify-between items-center mb-4">
-            <button onclick="addAuthKey()" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors">
+            <button onclick="addAuthKey()" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors text-sm lg:text-base">
               添加密钥
             </button>
           </div>
           
-          <div class="bg-white rounded-xl shadow-sm overflow-hidden">
+          <div class="bg-white rounded-xl shadow-sm overflow-hidden table-container">
             <table class="min-w-full divide-y divide-gray-200">
               <thead class="bg-gray-50">
                 <tr>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">密钥</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">状态</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">类型</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">密钥</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">状态</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">类型</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
                 </tr>
               </thead>
               <tbody class="bg-white divide-y divide-gray-200">
                 ${authKeys.map((key) => `
                   <tr>
-                    <td class="px-6 py-4 text-sm font-mono text-gray-900">${escapeHtml(key.key)}</td>
-                    <td class="px-6 py-4">
+                    <td class="px-4 lg:px-6 py-4 text-sm font-mono text-gray-900 break-all">${escapeHtml(key.key)}</td>
+                    <td class="px-4 lg:px-6 py-4">
                       <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
                         key.isEnabled ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-800"
                       }">
                         ${key.isEnabled ? "启用" : "禁用"}
                       </span>
                     </td>
-                    <td class="px-6 py-4 text-sm text-gray-500">
+                    <td class="px-4 lg:px-6 py-4 text-sm text-gray-500">
                       ${key.isDefault ? "默认" : "自定义"}
                     </td>
-                    <td class="px-6 py-4 text-sm space-x-2">
+                    <td class="px-4 lg:px-6 py-4 text-sm space-x-2">
                       <button onclick="toggleAuthKey('${key.key}')" class="text-indigo-600 hover:text-indigo-900">
                         ${key.isEnabled ? "禁用" : "启用"}
                       </button>
@@ -1870,44 +1271,43 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
           </div>
         </div>
 
-        <!-- 模型列表管理 -->
         <div id="models-section" class="content-section">
-          <div class="mb-6">
-            <h2 class="text-2xl font-bold text-gray-800 mb-2">模型列表管理</h2>
-            <p class="text-gray-500">管理可用的 AI 模型</p>
+          <div class="mb-4 lg:mb-6">
+            <h2 class="text-xl lg:text-2xl font-bold text-gray-800 mb-2">模型列表管理</h2>
+            <p class="text-gray-500 text-sm lg:text-base">管理可用的 AI 模型</p>
           </div>
           
           <div class="flex justify-between items-center mb-4">
-            <button onclick="addModel()" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors">
+            <button onclick="addModel()" class="bg-indigo-600 text-white px-4 py-2 rounded-lg hover:bg-indigo-700 transition-colors text-sm lg:text-base">
               添加模型
             </button>
           </div>
           
-          <div class="bg-white rounded-xl shadow-sm overflow-hidden">
+          <div class="bg-white rounded-xl shadow-sm overflow-hidden table-container">
             <table class="min-w-full divide-y divide-gray-200">
               <thead class="bg-gray-50">
                 <tr>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">模型 ID</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">状态</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">类型</th>
-                  <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">模型 ID</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">状态</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">类型</th>
+                  <th class="px-4 lg:px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">操作</th>
                 </tr>
               </thead>
               <tbody class="bg-white divide-y divide-gray-200">
                 ${models.map((model) => `
                   <tr>
-                    <td class="px-6 py-4 text-sm font-mono text-gray-900">${escapeHtml(model.id)}</td>
-                    <td class="px-6 py-4">
+                    <td class="px-4 lg:px-6 py-4 text-sm font-mono text-gray-900">${escapeHtml(model.id)}</td>
+                    <td class="px-4 lg:px-6 py-4">
                       <span class="inline-flex items-center px-2 py-1 rounded-full text-xs font-medium ${
                         model.isEnabled ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-800"
                       }">
                         ${model.isEnabled ? "启用" : "禁用"}
                       </span>
                     </td>
-                    <td class="px-6 py-4 text-sm text-gray-500">
+                    <td class="px-4 lg:px-6 py-4 text-sm text-gray-500">
                       ${model.isDefault ? "默认" : "自定义"}
                     </td>
-                    <td class="px-6 py-4 text-sm space-x-2">
+                    <td class="px-4 lg:px-6 py-4 text-sm space-x-2">
                       <button onclick="toggleModel('${model.id}')" class="text-indigo-600 hover:text-indigo-900">
                         ${model.isEnabled ? "禁用" : "启用"}
                       </button>
@@ -1924,32 +1324,42 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
   </div>
 
   <script>
-    // 切换内容区域
+    function toggleSidebar() {
+      const sidebar = document.getElementById('sidebar');
+      const overlay = document.getElementById('sidebarOverlay');
+      sidebar.classList.toggle('open');
+      overlay.classList.toggle('open');
+    }
+
+    function closeSidebar() {
+      const sidebar = document.getElementById('sidebar');
+      const overlay = document.getElementById('sidebarOverlay');
+      sidebar.classList.remove('open');
+      overlay.classList.remove('open');
+    }
+
     function showSection(sectionName) {
-      // 隐藏所有内容区域
-      document.querySelectorAll('.content-section').forEach(el => el.classList.remove('active'));
-      document.querySelectorAll('.content-section').forEach(el => el.classList.add('hidden'));
+      document.querySelectorAll('.content-section').forEach(el => {
+        el.classList.remove('active');
+        el.classList.add('hidden');
+      });
       
-      // 移除所有导航的激活状态
       document.querySelectorAll('nav a').forEach(el => el.classList.remove('sidebar-active'));
       
-      // 显示选中的内容区域
       const targetSection = document.getElementById(sectionName + '-section');
       if (targetSection) {
         targetSection.classList.remove('hidden');
         targetSection.classList.add('active');
       }
       
-      // 激活对应的导航项
       const targetNav = document.getElementById('nav-' + sectionName);
       if (targetNav) {
         targetNav.classList.add('sidebar-active');
       }
     }
 
-    // 退出登录 - 调用后端 API 删除会话
     async function logout() {
-      if (!confirm('确定要退出登录吗？')) return;
+      if (!confirm('确定要退出登录吗?')) return;
       
       try {
         const response = await fetch('/admin/api/logout', {
@@ -1961,17 +1371,16 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
           document.cookie = 'ml_admin_auth=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT';
           window.location.href = '/admin';
         } else {
-          alert('退出失败，请重试');
+          alert('退出失败,请重试');
         }
       } catch (error) {
         console.error('Logout error:', error);
-        alert('退出失败，请重试');
+        alert('退出失败,请重试');
       }
     }
 
-    // Cookie 管理函数
     function addCookie() {
-      const name = prompt('请输入 Cookie 名称（如 cookie_4）:');
+      const name = prompt('请输入 Cookie 名称(如 cookie_4):');
       if (!name) return;
       
       const cookieString = prompt('请输入完整的 Cookie 字符串:');
@@ -1990,12 +1399,11 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
     }
 
     function deleteCookie(id) {
-      if (!confirm('确定要删除这个 Cookie 吗？')) return;
+      if (!confirm('确定要删除这个 Cookie 吗?')) return;
       fetch(\`/admin/api/cookies/\${id}\`, { method: 'DELETE' })
         .then(() => location.reload());
     }
 
-    // Auth Key 管理函数
     function addAuthKey() {
       const key = prompt('请输入新的 API 密钥:');
       if (!key) return;
@@ -2013,12 +1421,11 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
     }
 
     function deleteAuthKey(key) {
-      if (!confirm('确定要删除这个 API 密钥吗？')) return;
+      if (!confirm('确定要删除这个 API 密钥吗?')) return;
       fetch(\`/admin/api/auth-keys/\${encodeURIComponent(key)}\`, { method: 'DELETE' })
         .then(() => location.reload());
     }
 
-    // Model 管理函数
     function addModel() {
       const modelId = prompt('请输入模型 ID:');
       if (!modelId) return;
@@ -2036,10 +1443,16 @@ function renderAdminPanel(stats: Stats, authKeys: AuthKey[], models: ModelConfig
     }
 
     function deleteModel(id) {
-      if (!confirm('确定要删除这个模型吗？')) return;
+      if (!confirm('确定要删除这个模型吗?')) return;
       fetch(\`/admin/api/models/\${encodeURIComponent(id)}\`, { method: 'DELETE' })
         .then(() => location.reload());
     }
+
+    window.addEventListener('resize', function() {
+      if (window.innerWidth >= 769) {
+        closeSidebar();
+      }
+    });
   </script>
 </body>
 </html>`;
@@ -2082,7 +1495,7 @@ async function handleAdminLogin(
   headers.set("Location", "/admin");
 
   return new Response(
-    `<html><body>登录成功，正在跳转...</body></html>`,
+    `<html><body>登录成功,正在跳转...</body></html>`,
     { status: 302, headers }
   );
 }
@@ -2325,12 +1738,6 @@ async function handler(request: Request): Promise<Response> {
       if (pathname === "/v1/chat/completions" && request.method === "POST") {
         return await handleChatCompletions(kv, request, cors);
       }
-      if (pathname === "/v1/completions" && request.method === "POST") {
-        return await handleCompletions(kv, request, cors);
-      }
-      if (pathname === "/v1/responses" && request.method === "POST") {
-        return await handleResponses(kv, request, cors);
-      }
     }
 
     if (pathname === "/admin" || pathname === "/admin/") {
@@ -2350,8 +1757,8 @@ async function handler(request: Request): Promise<Response> {
         JSON.stringify({
           message: "MovementLabs API Gateway",
           version: "2.0.0",
-          endpoints: ["/v1/models", "/v1/chat/completions", "/v1/completions", "/v1/responses", "/admin"],
-          features: ["自动配额检查", "失败重试机制", "侧边栏管理界面"]
+          endpoints: ["/v1/models", "/v1/chat/completions", "/admin"],
+          features: ["自动配额检查", "失败重试机制", "侧边栏管理界面", "调试日志"]
         }),
         { status: 200, headers: { ...cors, "Content-Type": "application/json" } }
       );
@@ -2359,7 +1766,7 @@ async function handler(request: Request): Promise<Response> {
 
     return new Response("Not found", { status: 404 });
   } catch (e) {
-    console.error("Handler error:", e);
+    debugError("Handler error:", e);
     return new Response(
       JSON.stringify({
         error: {
